@@ -18,6 +18,7 @@ from .client_mixins import (
     AuthEndpointsMixin,
     CreatorEndpointsMixin,
     InteractionEndpointsMixin,
+    MessagingEndpointsMixin,
     NotificationEndpointsMixin,
     ReadingEndpointsMixin,
     SocialEndpointsMixin,
@@ -43,6 +44,7 @@ class XhsClient(
     CreatorEndpointsMixin,
     SocialEndpointsMixin,
     NotificationEndpointsMixin,
+    MessagingEndpointsMixin,
     AuthEndpointsMixin,
 ):
     """Xiaohongshu API client with automatic signing, rate limiting, and retry."""
@@ -160,13 +162,23 @@ class XhsClient(
     def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response:
         self._rate_limit_delay()
         last_exc: Exception | None = None
+        # A timeout/5xx can arrive after the server accepted a message or note.
+        # These endpoints have no verified deduplication guarantee.
+        single_attempt = method.upper() == "POST" and url.split("?", 1)[0].endswith(
+            ("/api/im/web/short_link/send_message", "/web_api/sns/v2/note")
+        )
+        attempts = 1 if single_attempt else self._max_retries
 
-        for attempt in range(self._max_retries):
+        for attempt in range(attempts):
             try:
                 resp = self._http.request(method, url, **kwargs)
                 self._merge_response_cookies(resp)
                 self._mark_request()
                 if resp.status_code in (429, 500, 502, 503, 504):
+                    if single_attempt:
+                        raise XhsApiError(
+                            f"Write returned HTTP {resp.status_code}; outcome unconfirmed, not retried"
+                        )
                     wait = (2 ** attempt) + random.uniform(0, 1)
                     logger.warning(
                         "HTTP %d from %s, retrying in %.1fs (attempt %d/%d)",
@@ -176,6 +188,8 @@ class XhsClient(
                     continue
                 return resp
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if single_attempt:
+                    raise XhsApiError("Write response unavailable; outcome unconfirmed, not retried") from exc
                 last_exc = exc
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 logger.warning(
