@@ -1,12 +1,16 @@
 """Reading commands: search, read, comments, sub-comments, user, user-posts, feed, hot, topics, search-user."""
 
+from pathlib import Path
+
 import click
 
 from ..command_normalizers import normalize_paged_notes
 from ..cookies import cache_note_context
+from ..downloads import DEFAULT_DOWNLOAD_DIR, download_note_images
 from ..formatter import (
     maybe_print_structured,
     print_info,
+    print_success,
     render_comments,
     render_feed,
     render_note,
@@ -54,10 +58,24 @@ TYPE_MAP = {
 @click.argument("keyword")
 @click.option("--sort", type=click.Choice(["general", "popular", "latest"]), default="general", help="Sort order")
 @click.option("--type", "note_type", type=click.Choice(["all", "video", "image"]), default="all", help="Note type")
+@click.option("--time", "note_time", default="不限", show_default=True, help="Search time filter tag")
+@click.option("--range", "note_range", default="不限", show_default=True, help="Search range filter tag")
+@click.option("--distance", default="不限", show_default=True, help="Search distance filter tag")
 @click.option("--page", default=1, help="Page number")
 @structured_output_options
 @click.pass_context
-def search(ctx, keyword: str, sort: str, note_type: str, page: int, as_json: bool, as_yaml: bool):
+def search(
+    ctx,
+    keyword: str,
+    sort: str,
+    note_type: str,
+    note_time: str,
+    note_range: str,
+    distance: str,
+    page: int,
+    as_json: bool,
+    as_yaml: bool,
+):
     """Search notes by keyword."""
     def _search_action(client):
         result = client.search_notes(
@@ -65,6 +83,11 @@ def search(ctx, keyword: str, sort: str, note_type: str, page: int, as_json: boo
             page=page,
             sort=SORT_MAP[sort],
             note_type=TYPE_MAP[note_type],
+            filter_overrides={
+                "filter_note_time": note_time,
+                "filter_note_range": note_range,
+                "filter_pos_distance": distance,
+            },
         )
         _cache_tokens_from_items(result, xsec_source="pc_search")
         save_index_from_items(result, xsec_source="pc_search")
@@ -82,9 +105,26 @@ def search(ctx, keyword: str, sort: str, note_type: str, page: int, as_json: boo
 @click.command()
 @click.argument("id_or_url")
 @click.option("--xsec-token", default="", help="Security token (or reuse a cached token for this note)")
+@click.option("--save-images", is_flag=True, help="Download note images after reading")
+@click.option(
+    "--output",
+    "output_dir",
+    default=DEFAULT_DOWNLOAD_DIR,
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    show_default=True,
+    help="Directory for --save-images downloads",
+)
 @structured_output_options
 @click.pass_context
-def read(ctx, id_or_url: str, xsec_token: str, as_json: bool, as_yaml: bool):
+def read(
+    ctx,
+    id_or_url: str,
+    xsec_token: str,
+    save_images: bool,
+    output_dir: Path,
+    as_json: bool,
+    as_yaml: bool,
+):
     """Read a note by ID, URL, or short index."""
     note_id, token, url_source = resolve_note_reference(id_or_url, xsec_token=xsec_token)
     xsec_source = url_source or "pc_feed"
@@ -96,6 +136,30 @@ def read(ctx, id_or_url: str, xsec_token: str, as_json: bool, as_yaml: bool):
         if url_source:
             kwargs["xsec_source"] = url_source
         return client.get_note_detail(note_id, **kwargs)
+
+    if save_images:
+        try:
+            data = run_client_action(ctx, _read_action)
+            saved_images = download_note_images(data, output_dir)
+            if not maybe_print_structured(
+                {
+                    "note": data,
+                    "saved_images": [
+                        {"index": image.index, "url": image.url, "path": str(image.path)}
+                        for image in saved_images
+                    ],
+                },
+                as_json=as_json,
+                as_yaml=as_yaml,
+            ):
+                render_note(data)
+                if saved_images:
+                    print_success(f"Saved {len(saved_images)} image(s) to {saved_images[0].path.parent}")
+                else:
+                    print_info("No images to save")
+            return
+        except Exception as exc:
+            exit_for_error(exc, as_json=as_json, as_yaml=as_yaml)
 
     handle_command(
         ctx,
@@ -226,16 +290,27 @@ def topics(ctx, keyword: str, as_json: bool, as_yaml: bool):
 
 
 @click.command("sub-comments")
-@click.argument("note_id")
+@click.argument("id_or_url")
 @click.argument("comment_id")
 @click.option("--cursor", default="", help="Pagination cursor")
+@click.option("--xsec-token", default="", help="Security token")
 @structured_output_options
 @click.pass_context
-def sub_comments(ctx, note_id: str, comment_id: str, cursor: str, as_json: bool, as_yaml: bool):
-    """View replies to a specific comment."""
+def sub_comments(ctx, id_or_url: str, comment_id: str, cursor: str, xsec_token: str, as_json: bool, as_yaml: bool):
+    """View replies to a specific comment on a note (by ID, URL, or short index)."""
+    note_id, token, url_source = resolve_note_reference(id_or_url, xsec_token=xsec_token)
+    if token:
+        cache_note_context(note_id, token, url_source or "pc_feed")
+
+    def _load_sub_comments(client):
+        kwargs = {"xsec_token": token}
+        if url_source:
+            kwargs["xsec_source"] = url_source
+        return client.get_sub_comments(note_id, comment_id, cursor=cursor, **kwargs)
+
     handle_command(
         ctx,
-        action=lambda client: client.get_sub_comments(note_id, comment_id, cursor=cursor),
+        action=_load_sub_comments,
         render=render_comments,
         as_json=as_json,
         as_yaml=as_yaml,
@@ -244,13 +319,16 @@ def sub_comments(ctx, note_id: str, comment_id: str, cursor: str, as_json: bool,
 
 @click.command("search-user")
 @click.argument("keyword")
+@click.option("--page", default=1, type=click.IntRange(min=1), show_default=True, help="Page number (1-indexed)")
+@click.option("--page-size", default=20, type=click.IntRange(min=1), show_default=True, help="Users per page")
+@click.option("--search-id", default="", help="Reuse a search session ID across pages (optional)")
 @structured_output_options
 @click.pass_context
-def search_user(ctx, keyword: str, as_json: bool, as_yaml: bool):
+def search_user(ctx, keyword: str, page: int, page_size: int, search_id: str, as_json: bool, as_yaml: bool):
     """Search for users by keyword."""
     handle_command(
         ctx,
-        action=lambda client: client.search_users(keyword),
+        action=lambda client: client.search_users(keyword, page=page, page_size=page_size, search_id=search_id),
         render=render_users,
         as_json=as_json,
         as_yaml=as_yaml,

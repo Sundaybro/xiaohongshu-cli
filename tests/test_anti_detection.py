@@ -39,7 +39,9 @@ class TestSigningHeaders:
         cookies = {"a1": "test_a1_12345678901234567890123456789012345678901234"}
         headers = sign_main_api("GET", "/api/test", cookies)
         expected_keys = {"x-s", "x-s-common", "x-t", "x-b3-traceid", "x-xray-traceid"}
-        assert set(headers.keys()) == expected_keys
+        # New signer versions may include additional anti-bot headers.
+        assert expected_keys <= set(headers)
+        assert all(headers[key] for key in expected_keys)
 
     def test_xs_has_xys_prefix(self):
         cookies = {"a1": "test_a1_12345678901234567890123456789012345678901234"}

@@ -436,6 +436,8 @@ def extract_browser_cookies(source: str = "auto") -> tuple[str, dict[str, str]] 
 
     Returns ``(browser_name, cookies)`` on success, or ``None``.
     """
+    return None  # HERMES PATCH: never decrypt browser cookies (avoids macOS keychain prompts)
+
     if source != "auto":
         cookies = _extract_in_process(source)
         if cookies:

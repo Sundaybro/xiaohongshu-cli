@@ -1,11 +1,14 @@
 """Tests for CLI commands using Click's test runner."""
 
+from pathlib import Path
+
 import pytest
 import yaml
 from click.testing import CliRunner
 
 from xhs_cli.cli import cli
-from xhs_cli.exceptions import NoCookieError, SessionExpiredError, UnsupportedOperationError
+from xhs_cli.downloads import SavedImage
+from xhs_cli.exceptions import NoCookieError, RateLimitedError, SessionExpiredError, UnsupportedOperationError
 
 runner = CliRunner()
 
@@ -71,6 +74,8 @@ class TestCliBasic:
             "search", "read", "comments", "sub-comments", "user", "user-posts",
             "feed", "hot", "topics", "search-user", "my-notes",
             "notifications", "unread",
+            # Messages
+            "chats", "messages", "send",
             # Interactions
             "like", "favorite", "unfavorite", "comment", "reply", "delete-comment",
             # Social
@@ -172,6 +177,34 @@ class TestCliBasic:
         assert payload["ok"] is True
         assert payload["data"]["logged_out"] is True
 
+    def test_send_emits_structured_payload(self, monkeypatch):
+        monkeypatch.setenv("OUTPUT", "auto")
+        monkeypatch.setattr(
+            "xhs_cli.commands._common.run_client_action",
+            lambda ctx, action: {"mid": "m-1", "receiver_id": "peer-1", "response": {"code": 0}},
+        )
+
+        result = runner.invoke(cli, ["send", "peer-1", "-c", "hi", "--json"])
+
+        assert result.exit_code == 0
+        payload = yaml.safe_load(result.output)
+        assert payload["ok"] is True
+        assert payload["data"]["receiver_id"] == "peer-1"
+        assert payload["data"]["mid"] == "m-1"
+
+    def test_send_maps_throttle_to_rate_limited(self, monkeypatch):
+        def fake_run_client_action(ctx, action):
+            raise RateLimitedError("too fast")
+
+        monkeypatch.setattr("xhs_cli.commands._common.run_client_action", fake_run_client_action)
+
+        result = runner.invoke(cli, ["send", "peer-1", "-c", "hi", "--yaml"])
+
+        assert result.exit_code != 0
+        payload = yaml.safe_load(result.output)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "rate_limited"
+
     def test_delete_reports_unsupported_operation(self, monkeypatch):
         monkeypatch.setattr(
             "xhs_cli.commands.creator.run_client_action",
@@ -236,6 +269,27 @@ class TestCliBasic:
         assert "search_result/69ad061d" in result.output
         assert "very-long-token-value" not in result.output
 
+    def test_search_accepts_distance_filter_argument(self, monkeypatch):
+        captured = {}
+
+        def fake_handle_command(ctx, action, render, as_json, as_yaml):
+            class FakeClient:
+                def search_notes(self, **kwargs):
+                    captured.update(kwargs)
+                    return {"items": [], "has_more": False}
+
+            action(FakeClient())
+            return None
+
+        monkeypatch.setattr("xhs_cli.commands.reading.handle_command", fake_handle_command)
+
+        result = runner.invoke(cli, ["search", "旅行", "--sort", "popular", "--distance", "附近"])
+
+        assert result.exit_code == 0
+        assert captured["keyword"] == "旅行"
+        assert captured["sort"] == "popularity_descending"
+        assert captured["filter_overrides"]["filter_pos_distance"] == "附近"
+
     def test_feed_rich_output_shortens_visible_links(self, monkeypatch):
         monkeypatch.setenv("OUTPUT", "rich")
         monkeypatch.setattr(
@@ -265,6 +319,11 @@ class TestCliBasic:
         result = runner.invoke(cli, ["read", "--help"])
         assert result.exit_code == 0
         assert "index" in result.output.lower()
+
+    def test_read_help_mentions_save_images(self):
+        result = runner.invoke(cli, ["read", "--help"])
+        assert result.exit_code == 0
+        assert "--save-images" in result.output
 
     def test_comments_help_mentions_short_index(self):
         result = runner.invoke(cli, ["comments", "--help"])
@@ -302,6 +361,43 @@ class TestCliBasic:
         assert called["kwargs"]["xsec_token"] == "token-abc"
         assert called["kwargs"]["xsec_source"] == "pc_search"
 
+    def test_read_save_images_outputs_saved_paths(self, monkeypatch, tmp_path):
+        class FakeClient:
+            def get_note_detail(self, note_id, **kwargs):
+                assert note_id == "note-abc"
+                return FAKE_NOTE_RESPONSE
+
+        def fake_run_client_action(ctx, action):
+            return action(FakeClient())
+
+        output_dir = tmp_path / "downloads"
+        saved_path = output_dir / "note-abc" / "image-1.jpg"
+
+        monkeypatch.setattr("xhs_cli.commands.reading.run_client_action", fake_run_client_action)
+        monkeypatch.setattr(
+            "xhs_cli.commands.reading.download_note_images",
+            lambda data, output: [
+                SavedImage(
+                    index=1,
+                    url="https://img.example/image.jpg",
+                    path=Path(output) / "note-abc" / "image-1.jpg",
+                )
+            ],
+        )
+
+        result = runner.invoke(cli, ["read", "note-abc", "--save-images", "--output", str(output_dir), "--yaml"])
+
+        assert result.exit_code == 0
+        payload = yaml.safe_load(result.output)
+        assert payload["ok"] is True
+        assert payload["data"]["saved_images"] == [
+            {
+                "index": 1,
+                "url": "https://img.example/image.jpg",
+                "path": str(saved_path),
+            }
+        ]
+
     def test_comments_index_resolves_note_context(self, monkeypatch):
         monkeypatch.setattr(
             "xhs_cli.note_refs.get_note_by_index",
@@ -331,6 +427,54 @@ class TestCliBasic:
         assert result.exit_code == 0
         assert called["note_id"] == "note-abc"
         assert called["kwargs"]["xsec_token"] == "token-abc"
+        assert called["kwargs"]["xsec_source"] == "pc_search"
+
+    def test_sub_comments_passes_explicit_xsec_token(self, monkeypatch):
+        called = {}
+
+        class FakeClient:
+            def get_sub_comments(self, note_id, comment_id, cursor="", **kwargs):
+                called["note_id"] = note_id
+                called["comment_id"] = comment_id
+                called["cursor"] = cursor
+                called["kwargs"] = kwargs
+                return {"comments": []}
+
+        def fake_handle_command(ctx, action, render, as_json, as_yaml):
+            return action(FakeClient())
+
+        monkeypatch.setattr("xhs_cli.commands.reading.handle_command", fake_handle_command)
+
+        result = runner.invoke(
+            cli, ["sub-comments", "note-abc", "comment-1", "--xsec-token", "token-abc", "--cursor", "c1", "--yaml"]
+        )
+
+        assert result.exit_code == 0
+        assert called["note_id"] == "note-abc"
+        assert called["comment_id"] == "comment-1"
+        assert called["cursor"] == "c1"
+        assert called["kwargs"]["xsec_token"] == "token-abc"
+
+    def test_sub_comments_url_resolves_note_context(self, monkeypatch):
+        called = {}
+
+        class FakeClient:
+            def get_sub_comments(self, note_id, comment_id, cursor="", **kwargs):
+                called["note_id"] = note_id
+                called["kwargs"] = kwargs
+                return {"comments": []}
+
+        def fake_handle_command(ctx, action, render, as_json, as_yaml):
+            return action(FakeClient())
+
+        monkeypatch.setattr("xhs_cli.commands.reading.handle_command", fake_handle_command)
+
+        url = "https://www.xiaohongshu.com/explore/note-abc?xsec_token=token-url&xsec_source=pc_search"
+        result = runner.invoke(cli, ["sub-comments", url, "comment-1", "--yaml"])
+
+        assert result.exit_code == 0
+        assert called["note_id"] == "note-abc"
+        assert called["kwargs"]["xsec_token"] == "token-url"
         assert called["kwargs"]["xsec_source"] == "pc_search"
 
     def test_read_index_not_found_returns_usage_error(self, monkeypatch):

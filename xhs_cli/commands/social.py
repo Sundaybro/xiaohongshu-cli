@@ -4,9 +4,10 @@ from collections.abc import Callable
 from typing import Any
 
 import click
+from rich.table import Table
 
 from ..command_normalizers import normalize_paged_notes, resolve_current_user_id
-from ..formatter import print_info, print_success, render_user_posts
+from ..formatter import console, print_info, print_success, render_user_posts
 from ..note_refs import save_index_from_notes
 from ._common import handle_command, run_client_action, structured_output_options
 
@@ -103,5 +104,31 @@ def likes(ctx, user_id: str | None, cursor: str, as_json: bool, as_yaml: bool):
         ctx,
         fetcher=lambda client, uid, cur: client.get_user_likes(uid, cursor=cur),
         user_id=user_id, cursor=cursor, as_json=as_json, as_yaml=as_yaml,
+    )
+
+
+@click.command("following")
+@click.option("--page", default=1, type=click.IntRange(min=1), show_default=True)
+@click.option("--page-size", default=200, type=click.IntRange(1, 200), show_default=True)
+@structured_output_options
+@click.pass_context
+def following(ctx, page: int, page_size: int, as_json: bool, as_yaml: bool):
+    """List the current account's following users (web IM endpoint)."""
+    def _render(data):
+        table = Table(title="关注列表")
+        table.add_column("昵称")
+        table.add_column("用户 ID")
+        for item in data["users"]:
+            table.add_row(str(item.get("nick_name", "")), str(item.get("user_id", "")))
+        console.print(table)
+        if data["has_more"]:
+            print_info(f"More users may be available — use --page {data['next_page']} --page-size {page_size}")
+
+    handle_command(
+        ctx,
+        action=lambda client: client.get_following(page=page, page_size=page_size),
+        render=_render,
+        as_json=as_json,
+        as_yaml=as_yaml,
     )
 

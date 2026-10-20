@@ -24,7 +24,8 @@ A CLI for Xiaohongshu (小红书) — search, read, interact, and post via rever
 - 📰 **Feed** — recommendation feed, hot/trending by category
 - 👥 **Social** — follow/unfollow, favorites
 - 👍 **Interactions** — like, favorite, comment, reply, delete
-- ✍️ **Creator** — post image notes, my-notes list, delete
+- ✍️ **Creator** — post image/video notes, my-notes list, delete
+- 💬 **Direct messages** — conversation list, history, and send (`xhs chats` / `xhs messages` / `xhs send`)
 - 🔔 **Notifications** — unread count, mentions, likes, new followers
 - 🛡️ **Anti-detection** — consistent macOS Chrome fingerprint, `sec-ch-ua` alignment, session-stable browser identity, Gaussian jitter, captcha cooldown, exponential backoff
 - 📊 **Structured output** — commands support `--yaml` and `--json`; non-TTY stdout defaults to YAML
@@ -88,7 +89,7 @@ xhs comments "<url>" --all             # Fetch ALL comments (auto-paginate all p
 xhs comments "<url>" --all --json      # All comments as JSON
 xhs comments <note_id> --xsec-token T  # Use note_id + explicit xsec_token
 xhs comments <note_id>                 # Reuse cached token if available
-xhs sub-comments <note_id> <cmt_id>   # View replies to a comment
+xhs sub-comments "<url>" <cmt_id>      # View replies to a comment (URL / cached token / --xsec-token)
 xhs user <user_id>                     # User profile
 xhs user-posts <user_id>              # User's published notes
 xhs user-posts <user_id> --cursor X   # Paginate with cursor
@@ -132,7 +133,9 @@ xhs delete-comment <note_id> <cmt_id> # Delete own comment
 # ─── Creator ─────────────────────────────────────
 xhs my-notes                           # List own notes (v2 creator endpoint)
 xhs my-notes --page 1                 # Next page
-xhs post --title "标题" --body "正文" --images img.jpg  # Post note
+xhs post --title "标题" --body "正文" --images img.jpg  # Post image note
+xhs post-video --title "标题" --body "正文" --video video.mp4  # Post video note
+xhs post-video --title "标题" --body "正文" --video video.mov --cover cover.jpg  # Post video with custom cover
 xhs delete <note_id>                   # Delete note
 xhs delete <note_id> -y               # Skip confirmation
 
@@ -141,6 +144,9 @@ xhs unread                             # Unread counts (likes, mentions, follows
 xhs notifications                      # 评论和@ notifications
 xhs notifications --type likes        # 赞和收藏 notifications
 xhs notifications --type connections   # 新增关注 notifications
+xhs chats                              # Direct-message conversations (with unread)
+xhs messages <user_id>                 # Read one conversation's history
+xhs send <user_id> -c "你好"           # Send a direct message
 
 ```
 
@@ -174,6 +180,7 @@ After any listing command such as `search`, `feed`, `hot`, `user-posts`, `favori
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OUTPUT` | `auto` | Output format: `json`, `yaml`, `rich`, or `auto` (→ YAML when non-TTY) |
+| `XHS_WRITE_RPM` | `1` | Max direct messages per minute (cross-process throttle); `0` disables |
 ## Rate Limiting & Anti-Detection
 
 xiaohongshu-cli includes comprehensive anti-risk-control measures designed to minimize detection:
@@ -191,6 +198,13 @@ xiaohongshu-cli includes comprehensive anti-risk-control measures designed to mi
 ### Captcha Cooldown
 - **Progressive backoff**: On captcha trigger (HTTP 461/471), automatically sleeps 5→10→20→30 seconds with increasing delays
 - **Adaptive rate limiting**: Request delay is permanently doubled after a captcha event to reduce future risk
+
+### Write Throttle (Direct Messages)
+Direct messages are more sensitive than reads (roughly ten sends can trigger a captcha), so
+`xhs send` is gated by a cross-process token bucket: **1 write/minute by default**, persisted at
+`~/.xiaohongshu-cli/limiter.json`. Tune it with `XHS_WRITE_RPM=<n>`, or set `XHS_WRITE_RPM=0`
+to disable throttling. When the budget is exhausted the command fails with the `rate_limited`
+error code instead of silently hammering the API.
 
 ### Signed Requests
 - All API calls use `x-s` / `x-s-common` / `x-t` signatures (reverse-engineered from web client)
@@ -322,7 +336,7 @@ The built-in Gaussian jitter delay (~1-1.5s between requests) is intentional to 
 - 📰 **发现** — 推荐 Feed、按分类浏览热门
 - 👥 **社交** — 关注/取关、收藏夹
 - 👍 **互动** — 点赞、收藏、评论、回复、删除
-- ✍️ **创作者** — 发布图文笔记、我的笔记列表、删除
+- ✍️ **创作者** — 发布图文/视频笔记、我的笔记列表、删除
 - 🔔 **通知** — 未读数、@、点赞、新关注
 - 🛡️ **反风控** — macOS Chrome 指纹一致性、session 级浏览器身份持久化、高斯抖动延迟、验证码自动冷却、指数退避重试
 - 📊 **结构化输出** — `--yaml` / `--json`，非 TTY 默认输出 YAML
@@ -381,7 +395,7 @@ xhs comments "<url>" --all             # 获取全部评论（自动翻页）
 xhs comments "<url>" --all --json      # 全部评论，JSON 格式
 xhs comments <note_id> --xsec-token T  # 用 note_id + 显式 xsec_token
 xhs comments <note_id>                 # 如果之前访问过 URL，会复用缓存 token
-xhs sub-comments <note_id> <cmt_id>   # 查看评论的回复
+xhs sub-comments "<url>" <cmt_id>      # 查看评论的回复（支持 URL / 缓存 token / --xsec-token）
 xhs user <user_id>                     # 用户主页
 xhs user-posts <user_id>              # 用户发布的笔记
 
@@ -415,7 +429,9 @@ xhs delete-comment <note_id> <cmt_id>  # 删除自己的评论
 
 # 创作者
 xhs my-notes                           # 我的笔记列表
-xhs post --title "标题" --body "正文" --images img.jpg  # 发布笔记
+xhs post --title "标题" --body "正文" --images img.jpg  # 发布图文笔记
+xhs post-video --title "标题" --body "正文" --video video.mp4  # 发布视频笔记
+xhs post-video --title "标题" --body "正文" --video video.mov --cover cover.jpg  # 发布视频笔记（自定义封面）
 xhs delete <note_id>                   # 删除笔记
 xhs delete <note_id> -y                # 跳过确认
 
@@ -424,6 +440,9 @@ xhs unread                             # 未读数
 xhs notifications                      # 评论和 @ 通知
 xhs notifications --type likes         # 赞和收藏通知
 xhs notifications --type connections   # 新增关注通知
+xhs chats                              # 私信会话列表（含未读数）
+xhs messages <user_id>                 # 读某个会话的私信历史
+xhs send <user_id> -c "你好"           # 发送私信
 ```
 
 ## 认证策略

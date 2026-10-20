@@ -1,15 +1,18 @@
 """Creator commands: post, my-notes, delete."""
 
 import re
+from pathlib import Path
 
 import click
 
 from ..command_normalizers import select_topic_payload
+from ..exceptions import XhsApiError
 from ..formatter import (
     extract_note_id,
     maybe_print_structured,
     print_info,
     print_success,
+    render_creator_note_data,
     render_creator_notes,
 )
 from ..note_refs import save_index_from_notes
@@ -22,7 +25,25 @@ def extract_hashtags(body: str) -> list[str]:
     Matches '#tag' at start-of-string or preceded by whitespace.
     Does not match URL fragments like 'https://example.com#section'.
     """
-    return re.findall(r"(?:^|(?<=\s))#([^\s#]+)", body)
+    return [tag.removesuffix("[话题]") for tag in re.findall(r"(?:^|(?<=\s))#([^\s#]+)", body)]
+
+
+def format_body_hashtags(body: str, tag_map: dict[str, str]) -> str:
+    """Format hashtag occurrences in body to Xiaohongshu's native '#topic[话题]#' syntax.
+
+    Matches '#tag' at start-of-string or preceded by whitespace.
+    Replace complete tokens in one pass, including already-native markup.
+    """
+    if not tag_map:
+        return body
+
+    def replace(match: re.Match[str]) -> str:
+        raw_tag = match.group(1).removesuffix("[话题]")
+        if raw_tag not in tag_map:
+            return match.group(0)
+        return f"#{tag_map[raw_tag]}[话题]#"
+
+    return re.sub(r"(?:^|(?<=\s))#([^\s#]+)#?", replace, body)
 
 
 @click.command()
@@ -63,13 +84,19 @@ def post(
             unique_topics = unique_topics[:10]
 
         resolved_topics = []
+        tag_map: dict[str, str] = {}
         for t in unique_topics:
             topic_data = client.search_topics(t)
-            resolved_topics.extend(select_topic_payload(topic_data, t))
+            payloads = [p for p in select_topic_payload(topic_data, t) if p.get("id") and p.get("name")]
+            if payloads:
+                resolved_topics.extend(payloads)
+                tag_map[t] = payloads[0].get("name", t)
+
+        formatted_desc = format_body_hashtags(body, tag_map)
 
         return client.create_image_note(
             title=title,
-            desc=body,
+            desc=formatted_desc,
             image_file_ids=file_ids,
             topics=resolved_topics,
             is_private=is_private,
@@ -105,6 +132,25 @@ def my_notes(ctx, page: int, as_json: bool, as_yaml: bool):
     )
 
 
+@click.command("my-notes-data")
+@click.option("--page", default=1, help="Page number (1-indexed)")
+@click.option("--page-size", default=10, help="Page size")
+@structured_output_options
+@click.pass_context
+def my_notes_data(ctx, page: int, page_size: int, as_json: bool, as_yaml: bool):
+    """List your own published notes data."""
+    def _my_notes_data_action(client):
+        return client.get_creator_note_analyze_list(page_num=page, page_size=page_size)
+
+    handle_command(
+        ctx,
+        action=_my_notes_data_action,
+        render=render_creator_note_data,
+        as_json=as_json,
+        as_yaml=as_yaml,
+    )
+
+
 @click.command("delete")
 @click.argument("id_or_url")
 @structured_output_options
@@ -123,3 +169,80 @@ def delete(ctx, id_or_url: str, as_json: bool, as_yaml: bool, yes: bool):
             print_success(f"Deleted note {note_id}")
     except Exception as exc:
         exit_for_error(exc, as_json=as_json, as_yaml=as_yaml)
+
+
+@click.command("post-video")
+@click.option("--title", required=True, help="Video note title")
+@click.option("--body", required=True, help="Video note body text")
+@click.option("--video", required=True, help="Video file path (.mp4/.mov)")
+@click.option("--cover", help="Cover image file path (optional)")
+@click.option("--topic", "topics_flag", multiple=True, help="Topic(s)/hashtag(s) to search and attach")
+@click.option("--private", "is_private", is_flag=True, help="Publish as private note")
+@structured_output_options
+@click.pass_context
+def post_video(
+    ctx,
+    title: str,
+    body: str,
+    video: str,
+    cover: str | None,
+    topics_flag: tuple[str, ...],
+    is_private: bool,
+    as_json: bool,
+    as_yaml: bool,
+):
+    """Publish a video note."""
+    def _publish(client):
+        # Validate all local files before requesting permits or uploading.
+        if not Path(video).is_file():
+            raise XhsApiError(f"Video file not found: {video}")
+        if Path(video).suffix.lower() not in {".mp4", ".mov"}:
+            raise XhsApiError("Video file must be .mp4 or .mov")
+        if Path(video).stat().st_size == 0:
+            raise XhsApiError("Video file is empty")
+        if cover and not Path(cover).is_file():
+            raise XhsApiError(f"Cover image not found: {cover}")
+        
+        # 上传视频
+        click.echo(f"Uploading video {video}...", err=True)
+        video_permit = client.get_video_upload_permit()
+        client.upload_video(video_permit["fileId"], video_permit["token"], video)
+        video_file_id = video_permit["fileId"]
+        click.echo(f"Uploaded video: {video}", err=True)
+        
+        # 上传封面（如果提供）
+        cover_file_id = None
+        if cover:
+            click.echo(f"Uploading cover {cover}...", err=True)
+            cover_permit = client.get_upload_permit()
+            client.upload_file(cover_permit["fileId"], cover_permit["token"], cover)
+            cover_file_id = cover_permit["fileId"]
+            click.echo(f"Uploaded cover: {cover}", err=True)
+        
+        # 处理话题
+        topics = []
+        tag_map = {}
+        for topic in list(dict.fromkeys([*topics_flag, *extract_hashtags(body)]))[:10]:
+            topic_data = client.search_topics(topic)
+            payloads = [p for p in select_topic_payload(topic_data, topic) if p.get("id") and p.get("name")]
+            if payloads:
+                topics.extend(payloads)
+                tag_map[topic] = payloads[0]["name"]
+        
+        # 创建视频笔记
+        return client.create_video_note(
+            title=title,
+            desc=format_body_hashtags(body, tag_map),
+            video_file_id=video_file_id,
+            cover_file_id=cover_file_id,
+            topics=topics,
+            is_private=is_private,
+        )
+
+    handle_command(
+        ctx,
+        action=_publish,
+        render=lambda _data: print_success(f"Video note published: {title}" + (" (private)" if is_private else "")),
+        as_json=as_json,
+        as_yaml=as_yaml,
+    )

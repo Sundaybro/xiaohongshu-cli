@@ -9,10 +9,13 @@ import random
 import re
 import threading
 import time
+import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .command_normalizers import resolve_current_user_id
 from .constants import CREATOR_HOST, HOME_URL, UPLOAD_HOST, USER_AGENT
 from .cookies import (
     cache_note_context,
@@ -23,6 +26,8 @@ from .cookies import (
 )
 from .exceptions import NeedVerifyError, UnsupportedOperationError, XhsApiError
 from .html_parser import extract_note_from_html
+from .im_codec import CONTENT_TYPE_TEXT, encode_chat_message, encrypt_payload
+from .limiter import check_write_budget
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +196,21 @@ def get_search_session_stats() -> dict[str, Any]:
         }
 
 
+def _build_search_filters(filter_overrides: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    filters = [
+        {"tags": list(item["tags"]), "type": item["type"]}
+        for item in _SEARCH_DEFAULT_FILTERS
+    ]
+    if not filter_overrides:
+        return filters
+
+    for item in filters:
+        filter_value = filter_overrides.get(item["type"], "").strip()
+        if filter_value:
+            item["tags"] = [filter_value]
+    return filters
+
+
 class ReadingEndpointsMixin:
     """Read-only note, profile, and discovery endpoints."""
 
@@ -271,6 +291,33 @@ class ReadingEndpointsMixin:
             "image_scenes": "FD_WM_WEBP",
         })
 
+    def get_browsing_history(self, cursor: str = "", note_index: int = 0) -> dict[str, Any]:
+        """Current account's note browsing history, matching the web profile tab."""
+        if note_index < 0:
+            raise ValueError("note_index must be non-negative")
+        data = self._main_api_get("/api/sns/web/v1/common/dual_feed", {
+            "scene": "browse_history",
+            "cursor_score": cursor,
+            "note_index": note_index,
+            "image_formats": "jpg,webp,avif",
+        })
+        if not isinstance(data, dict):
+            raise XhsApiError("Unexpected browsing-history response")
+        result = data.get("result") or {}
+        if result.get("success") is False or result.get("code") not in (None, 0, "0"):
+            raise XhsApiError(f"Browsing history rejected: {result.get('message') or result.get('code')}")
+        notes = data.get("data")
+        no_more = data.get("has_no_more", data.get("hasNoMore"))
+        if not isinstance(notes, list) or not isinstance(no_more, bool):
+            raise XhsApiError("Unexpected browsing-history response; missing data list or pagination flag")
+        return {
+            "notes": notes,
+            "has_more": not no_more,
+            "cursor": data.get("next_cursor", data.get("nextCursor", "")) or "",
+            "next_note_index": note_index + len(notes),
+            "source": "account_browsing_history",
+        }
+
     def search_notes(
         self,
         keyword: str,
@@ -278,6 +325,7 @@ class ReadingEndpointsMixin:
         page_size: int = 20,
         sort: str = "general",
         note_type: int = 0,
+        filter_overrides: dict[str, str] | None = None,
     ) -> Any:
         search_id, is_new_session = _acquire_search_session(keyword, sort, note_type)
         if is_new_session:
@@ -304,7 +352,7 @@ class ReadingEndpointsMixin:
             "sort": sort,
             "note_type": note_type,
             "ext_flags": [],
-            "filters": _SEARCH_DEFAULT_FILTERS,
+            "filters": _build_search_filters(filter_overrides),
             "geo": "",
             "image_formats": ["jpg", "webp", "avif"],
         })
@@ -385,31 +433,27 @@ class ReadingEndpointsMixin:
     def get_hot_feed(self, category: str = "homefeed.fashion_v3") -> dict[str, Any]:
         return self.get_home_feed(category=category)
 
-    def get_comments(
+    def _request_with_note_context(
         self,
         note_id: str,
-        cursor: str = "",
-        xsec_token: str = "",
-        top_comment_id: str = "",
-        xsec_source: str = "",
+        xsec_token: str,
+        xsec_source: str,
+        request: Callable[[str], Any],
+        *,
+        purpose: str,
     ) -> Any:
+        """Run ``request(token)`` with a resolved xsec_token, retrying once if a cached token is stale."""
         cached = get_cached_note_context(note_id)
         used_cached_context = not xsec_token and bool(cached.get("token"))
         token, source = self.resolve_xsec_context(note_id, xsec_token, xsec_source)
         if not token:
             raise XhsApiError(
-                "Could not resolve xsec_token for comments. Pass a full note URL or --xsec-token explicitly."
+                f"Could not resolve xsec_token for {purpose}. Pass a full note URL or --xsec-token explicitly."
             )
         if source:
             cache_note_context(note_id, token, source)
         try:
-            return self._main_api_get("/api/sns/web/v2/comment/page", {
-                "note_id": note_id,
-                "cursor": cursor,
-                "top_comment_id": top_comment_id,
-                "image_formats": "jpg,webp,avif",
-                "xsec_token": token,
-            })
+            return request(token)
         except (NeedVerifyError, XhsApiError):
             if not used_cached_context:
                 raise
@@ -419,13 +463,26 @@ class ReadingEndpointsMixin:
                 raise
             if refreshed_source:
                 cache_note_context(note_id, refreshed_token, refreshed_source)
+            return request(refreshed_token)
+
+    def get_comments(
+        self,
+        note_id: str,
+        cursor: str = "",
+        xsec_token: str = "",
+        top_comment_id: str = "",
+        xsec_source: str = "",
+    ) -> Any:
+        def _request(token: str) -> Any:
             return self._main_api_get("/api/sns/web/v2/comment/page", {
                 "note_id": note_id,
                 "cursor": cursor,
                 "top_comment_id": top_comment_id,
                 "image_formats": "jpg,webp,avif",
-                "xsec_token": refreshed_token,
+                "xsec_token": token,
             })
+
+        return self._request_with_note_context(note_id, xsec_token, xsec_source, _request, purpose="comments")
 
     def get_all_comments(
         self,
@@ -472,13 +529,22 @@ class ReadingEndpointsMixin:
         root_comment_id: str,
         num: int = 30,
         cursor: str = "",
+        xsec_token: str = "",
+        xsec_source: str = "",
     ) -> Any:
-        return self._main_api_get("/api/sns/web/v2/comment/sub/page", {
-            "note_id": note_id,
-            "root_comment_id": root_comment_id,
-            "num": num,
-            "cursor": cursor,
-        })
+        # The sub-comment endpoint requires the same xsec_token as /comment/page;
+        # without it the API answers with a 461 captcha challenge.
+        def _request(token: str) -> Any:
+            return self._main_api_get("/api/sns/web/v2/comment/sub/page", {
+                "note_id": note_id,
+                "root_comment_id": root_comment_id,
+                "num": num,
+                "cursor": cursor,
+                "image_formats": "jpg,webp,avif",
+                "xsec_token": token,
+            })
+
+        return self._request_with_note_context(note_id, xsec_token, xsec_source, _request, purpose="sub-comments")
 
 
 class InteractionEndpointsMixin:
@@ -528,17 +594,37 @@ class CreatorEndpointsMixin:
             "page": {"page_size": 20, "page": 1},
         })
 
-    def search_users(self, keyword: str) -> dict[str, Any]:
+    def search_users(
+        self,
+        keyword: str,
+        page: int = 1,
+        page_size: int = 20,
+        search_id: str = "",
+    ) -> dict[str, Any]:
+        if page < 1 or page_size < 1:
+            raise ValueError("page and page_size must be positive integers")
         return self._creator_post("/web_api/sns/v1/search/user_info", {
             "keyword": keyword,
-            "search_id": str(int(time.time() * 1000)),
-            "page": {"page_size": 20, "page": 1},
+            "search_id": search_id or str(int(time.time() * 1000)),
+            "page": {"page_size": page_size, "page": page},
         })
 
     def get_upload_permit(self, file_type: str = "image", count: int = 1) -> dict[str, str]:
         data = self._creator_get("/api/media/v1/upload/web/permit", {
             "biz_name": "spectrum",
             "scene": file_type,
+            "file_count": count,
+            "version": 1,
+            "source": "web",
+        })
+        permit = data["uploadTempPermits"][0]
+        return {"fileId": permit["fileIds"][0], "token": permit["token"]}
+
+    def get_video_upload_permit(self, count: int = 1) -> dict[str, str]:
+        """获取视频上传许可"""
+        data = self._creator_get("/api/media/v1/upload/web/permit", {
+            "biz_name": "spectrum",
+            "scene": "video",
             "file_count": count,
             "version": 1,
             "source": "web",
@@ -570,6 +656,31 @@ class CreatorEndpointsMixin:
         if resp.status_code >= 400:
             raise XhsApiError(f"Upload failed: {resp.status_code} {resp.reason_phrase}")
 
+    def upload_video(
+        self,
+        file_id: str,
+        token: str,
+        file_path: str,
+        content_type: str | None = None,
+    ) -> None:
+        """上传视频文件"""
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+
+        url = f"{UPLOAD_HOST}/{file_id}"
+        content_type = content_type or mimetypes.guess_type(file_path)[0] or "video/mp4"
+        resp = self._request_with_retry(
+            "PUT",
+            url,
+            headers={
+                "X-Cos-Security-Token": token,
+                "Content-Type": content_type,
+            },
+            content=file_data,
+        )
+        if resp.status_code >= 400:
+            raise XhsApiError(f"Video upload failed: {resp.status_code} {resp.reason_phrase}")
+
     def create_image_note(
         self,
         title: str,
@@ -593,7 +704,7 @@ class CreatorEndpointsMixin:
                 "note_id": "",
                 "desc": desc,
                 "source": '{"type":"web","ids":"","extraInfo":"{\\"subType\\":\\"official\\"}"}',
-                "business_binds": json.dumps(business_binds),
+                "business_binds": json.dumps(business_binds, ensure_ascii=False),
                 "ats": [],
                 "hash_tag": topics or [],
                 "post_loc": {},
@@ -606,6 +717,54 @@ class CreatorEndpointsMixin:
             "origin": CREATOR_HOST,
             "referer": f"{CREATOR_HOST}/",
         })
+
+    def create_video_note(
+        self,
+        title: str,
+        desc: str,
+        video_file_id: str,
+        cover_file_id: str | None = None,
+        topics: list[dict[str, str]] | None = None,
+        is_private: bool = False,
+    ) -> Any:
+        """创建视频笔记"""
+        # 视频信息
+        video_info = {
+            "file_id": video_file_id,
+            "metadata": {"source": -1}
+        }
+        
+        # 封面信息（如果有）
+        images = []
+        if cover_file_id:
+            images = [{"file_id": cover_file_id, "metadata": {"source": -1}}]
+        
+        business_binds = {
+            "version": 1,
+            "noteId": 0,
+            "noteOrderBind": {},
+            "notePostTiming": {"postTime": None},
+            "noteCollectionBind": {"id": ""},
+        }
+        
+        data = {
+            "common": {
+                "type": "video",
+                "title": title,
+                "note_id": "",
+                "desc": desc,
+                "source": '{"type":"web","ids":"","extraInfo":"{\\"subType\\":\\"official\\"}"}',
+                "business_binds": json.dumps(business_binds, ensure_ascii=False),
+                "ats": [],
+                "hash_tag": topics or [],
+                "post_loc": {},
+                "privacy_info": {"op_type": 1, "type": 1 if is_private else 0},
+            },
+            "image_info": {"images": images} if images else None,
+            "video_info": video_info,
+        }
+        
+        return self._creator_post("/web_api/sns/v2/note", data)
 
     def delete_note(self, note_id: str) -> dict[str, Any]:
         try:
@@ -627,9 +786,44 @@ class CreatorEndpointsMixin:
             "page": page,
         })
 
+    def get_creator_note_analyze_list(self, type: int = 0, page_size: int = 10, page_num: int = 1) -> dict[str, Any]:
+        data = self._creator_get("/api/galaxy/creator/datacenter/note/analyze/list", {
+            "type": type,
+            "page_size": page_size,
+            "page_num": page_num,
+        })
+        result = data.get("result") if isinstance(data, dict) else None
+        if isinstance(result, dict) and (
+            result.get("success") is False or result.get("code") not in (None, 0, "0")
+        ):
+            raise XhsApiError(
+                f"Creator analytics rejected: {result.get('message') or result.get('code')}",
+                code=result.get("code"),
+                response=result,
+            )
+        return data
+
 
 class SocialEndpointsMixin:
     """Social graph and saved-content endpoints."""
+
+    def get_following(self, page: int = 1, page_size: int = 200) -> dict[str, Any]:
+        """Current account's following list, using the web IM social service."""
+        if page < 1 or not 1 <= page_size <= 200:
+            raise ValueError("page must be positive; page_size must be between 1 and 200")
+        data = self._main_api_get("/api/im/web/users/following/all", {"page": page, "size": page_size})
+        users = data.get("follow_user_d_t_o_list") if isinstance(data, dict) else None
+        if not isinstance(users, list):
+            raise XhsApiError("Unexpected following response; expected follow_user_d_t_o_list")
+        return {
+            "users": users,
+            "page": page,
+            "page_size": page_size,
+            "has_more": len(users) >= page_size,
+            "next_page": page + 1 if len(users) >= page_size else None,
+            "pagination_inferred": True,
+            "source": "im_following",
+        }
 
     def follow_user(self, user_id: str) -> dict[str, Any]:
         return self._main_api_post("/api/sns/web/v1/user/follow", {"target_user_id": user_id})
@@ -675,6 +869,145 @@ class NotificationEndpointsMixin:
             "num": num,
             "cursor": cursor,
         })
+
+
+def _message_delivery_error(result: Any) -> str:
+    """Return a description unless the IM response positively confirms delivery.
+
+    Deliberately requires *positive* confirmation rather than the absence of a
+    failure marker.  ``_handle_response`` returns ``None`` for an empty body, so
+    "no failure marker found" would otherwise report a silent drop as a
+    successful send — the exact failure mode that makes a write API untrustworthy
+    for outreach work.  An unrecognised shape is reported as unconfirmed, which
+    is the safe direction: a false failure is recoverable, a false success is not.
+    """
+    if not isinstance(result, dict) or not result:
+        return "empty or non-dict response — delivery unconfirmed"
+    if result.get("success") is False:
+        return str(result.get("msg") or result.get("message") or "success=false")
+    code = result.get("code")
+    if code not in (None, 0, "0"):
+        return str(result.get("msg") or result.get("message") or f"code={code}")
+    # 观测到的成功响应形状是 {"chat_ack": ..., "message_id": "<server id>"}：
+    # 服务端签发的 message_id 就是投递凭证，比 code=0 更强。
+    if result.get("message_id") or result.get("success") is True or code in (0, "0"):
+        return ""
+    # 带上顶层字段名，让"未确认"可诊断而不必靠猜。
+    return (
+        "response carries no delivery marker — unconfirmed "
+        f"(keys: {sorted(result)})"
+    )
+
+
+class MessagingEndpointsMixin:
+    """Direct-message (IM) endpoints: conversation reads and short-link send.
+
+    小红书私信不在 ``/api/sns/web/`` 命名空间下，而是独立的 ``/api/im/web/``
+    前缀，但同在 edith 主机、共用同一套 x-s 签名，所以直接复用
+    ``_main_api_get`` / ``_main_api_post`` 即可，无需额外的传输层或握手。
+
+    注意 ``/api/sns/web/unread_count``（``get_unread_count``）只统计通知
+    （评论和@ / 赞和收藏 / 新增关注），**不包含私信**；私信未读要单独取
+    ``/api/im/web/chat/get_unread``。
+
+    发送走 HTTP short-link 兜底：把 protobuf 私信体 RSA 加密后 POST，
+    不需要建立 WebSocket（详见 ``im_codec``）。
+    """
+
+    def get_im_unread(self) -> dict[str, Any]:
+        """Per-peer direct-message unread counts, keyed by user id."""
+        return self._main_api_get("/api/im/web/chat/get_unread", {})
+
+    def get_chats(self, limit: int = 50, page: int = 0) -> dict[str, Any]:
+        """Conversation list (the message page's left column)."""
+        return self._main_api_get("/api/im/web/v3/chats", {
+            "limit": limit,
+            "complete": "true",
+            "page": page,
+            "source": "pc",
+        })
+
+    def get_chat_messages(
+        self,
+        chat_user_id: str,
+        limit: int = 30,
+        last_id: int = 0,
+        start_id: int = 0,
+    ) -> dict[str, Any]:
+        """Message history for one conversation, newest first."""
+        return self._main_api_get("/api/im/web/messages/history", {
+            "chat_user_id": chat_user_id,
+            "last_id": last_id,
+            "start_id": start_id,
+            "limit": limit,
+        })
+
+    def send_direct_message(
+        self,
+        receiver_id: str,
+        content: str,
+        *,
+        content_type: int = 1,
+    ) -> dict[str, Any]:
+        """Send one direct message over the RSA short-link HTTP transport.
+
+        发送前先过本地写入限流（``XHS_WRITE_RPM``，默认 1 写/分钟），再解析
+        当前用户 id 作为 sender。返回体不做 ``ok`` 硬编码：``_handle_response``
+        已拒绝 ``success=false``，这里再检查嵌套 ``code``，并在失败时抛错。
+        """
+        receiver = str(receiver_id or "")
+        text = str(content or "")
+        if not receiver:
+            raise XhsApiError("receiver_id is required")
+        if not text:
+            raise XhsApiError("content is required")
+        # 只支持文本；图片/卡片需要另一种 payload 结构，传 1 以外的值会造出
+        # 服务端无法解析的消息体。
+        if int(content_type) != CONTENT_TYPE_TEXT:
+            raise XhsApiError(
+                f"only content_type={CONTENT_TYPE_TEXT} (text) is supported"
+            )
+
+        sender = resolve_current_user_id(self.get_self_info())
+        if not sender:
+            raise XhsApiError(
+                "Cannot resolve the current user id — run 'xhs login' or 'xhs status' first"
+            )
+
+        # Consume the throttle immediately before the sensitive POST, so a
+        # session-expiry retry through run_client_action is not double-charged.
+        check_write_budget("dm")
+
+        local_mid = str(uuid.uuid4())
+        payload = encode_chat_message(
+            local_mid=local_mid,
+            timestamp_ms=int(time.time() * 1000),
+            sender_id=sender,
+            receiver_id=receiver,
+            content=text,
+            content_type=int(content_type),
+        )
+        encrypted = encrypt_payload(payload)
+        result = self._main_api_post(
+            "/api/im/web/short_link/send_message",
+            {"message": encrypted.decode("latin-1")},
+        )
+
+        rejection = _message_delivery_error(result)
+        if rejection:
+            raise XhsApiError(
+                f"Direct message rejected by XHS: {rejection}",
+                response=result if isinstance(result, dict) else None,
+            )
+        # message_id 由服务端签发，是真正的投递凭证；local_mid 只是客户端
+        # 生成的追踪 id，不能当成送达证明。
+        server_id = result.get("message_id", "") if isinstance(result, dict) else ""
+        return {
+            "message_id": str(server_id),
+            "local_mid": local_mid,
+            "receiver_id": receiver,
+            "response": result,
+        }
 
 
 class AuthEndpointsMixin:
