@@ -17,11 +17,13 @@
 修改源码并检查后，从源码目录安装：
 
 ```bash
-uv tool install --force .
+uv tool install --force --reinstall-package xiaohongshu-cli .
 xhs --help
 ```
 
 直接改 site-packages 会在重装时丢失。本功能分支不宜用 `uv tool upgrade xiaohongshu-cli` 替换为 PyPI 包，否则可能覆盖扩展能力与 HERMES 补丁。
+
+源码变更但包版本未变化时，uv 可能复用旧构建；显式重装该包，并从源码目录之外导入检查，确认实际安装文件包含新功能，避免只检查源码或帮助文本而误报更新完成。
 
 ## 更新分支
 
