@@ -1,3 +1,9 @@
+import json
+
+import pytest
+from click.testing import CliRunner
+
+from xhs_cli.cli import cli
 from xhs_cli.commands.creator import extract_hashtags, format_body_hashtags
 
 
@@ -53,4 +59,65 @@ def test_format_body_hashtags():
         format_body_hashtags("#tag at start and #end", {"tag": "tag", "end": "end"})
         == "#tag[话题]# at start and #end[话题]#"
     )
+
+
+def test_native_hashtags_are_not_formatted_twice():
+    body = "正文 #旅行[话题]# #美食"
+    assert extract_hashtags(body) == ["旅行", "美食"]
+    formatted = format_body_hashtags(body, {"旅行": "旅行", "美食": "美食"})
+    assert formatted == "正文 #旅行[话题]# #美食[话题]#"
+    assert format_body_hashtags(formatted, {"旅行": "旅行", "美食": "美食"}) == formatted
+    assert format_body_hashtags("#旅行[话题]#", {"旅行": "旅行日记"}) == "#旅行日记[话题]#"
+
+
+def test_format_only_complete_resolved_tokens():
+    assert format_body_hashtags("#美股大跌 #未知 #美股", {"美股": "股票"}) == "#美股大跌 #未知 #股票[话题]#"
+    assert format_body_hashtags("#raw", {"raw": r"name\1"}) == "#name\\1[话题]#"
+    assert format_body_hashtags("#旅行#", {"旅行": "旅行"}) == "#旅行[话题]#"
+
+
+@pytest.mark.parametrize("command", ["post", "post-video"])
+@pytest.mark.parametrize("tag", ["#旅行", "#旅行[话题]#"])
+def test_publish_formats_body_and_attaches_only_resolved_topics(command, tag, tmp_path, monkeypatch):
+    media = tmp_path / ("image.jpg" if command == "post" else "video.mp4")
+    media.write_bytes(b"mock media, never uploaded")
+    calls = []
+    captured = {}
+
+    class FakeClient:
+        def get_upload_permit(self):
+            return {"fileId": "media", "token": "fake"}
+
+        get_video_upload_permit = get_upload_permit
+
+        def upload_file(self, *args):
+            pass
+
+        upload_video = upload_file
+
+        def search_topics(self, name):
+            calls.append(name)
+            if name == "旅行":
+                return {"topic_info_dtos": [{"id": "topic-id", "name": "旅行日记"}]}
+            if name == "无ID":
+                return {"topic_info_dtos": [{"name": "无ID"}]}
+            return {"topic_info_dtos": []}
+
+        def create_image_note(self, **kwargs):
+            captured.update(kwargs)
+            return {"note_id": "fake-note"}
+
+        create_video_note = create_image_note
+
+    monkeypatch.setattr("xhs_cli.commands._common.run_client_action", lambda ctx, action: action(FakeClient()))
+    flag = "--images" if command == "post" else "--video"
+    result = CliRunner().invoke(cli, [
+        command, "--title", "test", "--body", f"{tag} #未知 #无ID https://example.com#旅行",
+        flag, str(media), "--topic", "旅行", "--json",
+    ])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["ok"] is True
+    assert calls == ["旅行", "未知", "无ID"]
+    assert captured["desc"] == "#旅行日记[话题]# #未知 #无ID https://example.com#旅行"
+    assert captured["topics"] == [{"id": "topic-id", "name": "旅行日记", "type": "topic"}]
 

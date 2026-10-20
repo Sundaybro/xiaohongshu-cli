@@ -25,26 +25,25 @@ def extract_hashtags(body: str) -> list[str]:
     Matches '#tag' at start-of-string or preceded by whitespace.
     Does not match URL fragments like 'https://example.com#section'.
     """
-    return re.findall(r"(?:^|(?<=\s))#([^\s#]+)", body)
+    return [tag.removesuffix("[话题]") for tag in re.findall(r"(?:^|(?<=\s))#([^\s#]+)", body)]
 
 
 def format_body_hashtags(body: str, tag_map: dict[str, str]) -> str:
     """Format hashtag occurrences in body to Xiaohongshu's native '#topic[话题]#' syntax.
 
     Matches '#tag' at start-of-string or preceded by whitespace.
-    Sorts keys by length descending to prevent substring collisions (e.g., #美股 vs #美股大跌).
+    Replace complete tokens in one pass, including already-native markup.
     """
     if not tag_map:
         return body
 
-    formatted = body
-    for raw_tag in sorted(tag_map.keys(), key=len, reverse=True):
-        official_name = tag_map[raw_tag]
-        pattern = re.compile(rf"(?:^|(?<=\s))#{re.escape(raw_tag)}(?=[\s#]|$)")
-        replacement = f"#{official_name}[话题]#"
-        formatted = pattern.sub(replacement, formatted)
+    def replace(match: re.Match[str]) -> str:
+        raw_tag = match.group(1).removesuffix("[话题]")
+        if raw_tag not in tag_map:
+            return match.group(0)
+        return f"#{tag_map[raw_tag]}[话题]#"
 
-    return formatted
+    return re.sub(r"(?:^|(?<=\s))#([^\s#]+)#?", replace, body)
 
 
 @click.command()
@@ -88,12 +87,10 @@ def post(
         tag_map: dict[str, str] = {}
         for t in unique_topics:
             topic_data = client.search_topics(t)
-            payloads = select_topic_payload(topic_data, t)
+            payloads = [p for p in select_topic_payload(topic_data, t) if p.get("id") and p.get("name")]
             if payloads:
                 resolved_topics.extend(payloads)
                 tag_map[t] = payloads[0].get("name", t)
-            else:
-                tag_map[t] = t
 
         formatted_desc = format_body_hashtags(body, tag_map)
 
@@ -224,14 +221,18 @@ def post_video(
         
         # 处理话题
         topics = []
+        tag_map = {}
         for topic in list(dict.fromkeys([*topics_flag, *extract_hashtags(body)]))[:10]:
             topic_data = client.search_topics(topic)
-            topics.extend(select_topic_payload(topic_data, topic))
+            payloads = [p for p in select_topic_payload(topic_data, topic) if p.get("id") and p.get("name")]
+            if payloads:
+                topics.extend(payloads)
+                tag_map[topic] = payloads[0]["name"]
         
         # 创建视频笔记
         return client.create_video_note(
             title=title,
-            desc=body,
+            desc=format_body_hashtags(body, tag_map),
             video_file_id=video_file_id,
             cover_file_id=cover_file_id,
             topics=topics,
