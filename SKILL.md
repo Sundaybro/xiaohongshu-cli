@@ -1,257 +1,49 @@
 ---
 name: xiaohongshu-cli
-description: Use xiaohongshu-cli for ALL Xiaohongshu (Little Red Book, 小红书) operations — searching notes, reading content, browsing users, liking, collecting, commenting, following, posting, and direct messaging. Invoke whenever the user requests any Xiaohongshu interaction.
-author: jackwener
-version: "0.6.4"
-tags:
-  - xiaohongshu
-  - xhs
-  - redbook
-  - 小红书
-  - social-media
-  - cli
+description: 使用 xiaohongshu-cli 功能版或已登录浏览器操作小红书，支持搜索分页、读取笔记和评论、用户与关注列表、收藏和赞过列表、浏览历史、私信、发布及 CLI 维护。用户要求小红书账号操作或内容调研时使用。
 ---
 
-# xiaohongshu-cli — Xiaohongshu CLI Tool
+# 小红书 CLI 操作
 
-**Binary:** `xhs`
-**Credentials:** browser cookies (auto-extracted) or browser-assisted QR login (`--qrcode`)
+优先使用已安装的 `xhs`。本分支包含额外功能，包版本可能仍为 0.6.4；先执行 `xhs --help` 和目标子命令的 `--help`，不要仅凭版本号判断能力。命令、分页与响应字段见 [references/commands.md](references/commands.md)。
 
-## Setup
+## 登录与账号
 
-```bash
-# Install (requires Python 3.10+)
-uv tool install xiaohongshu-cli
-# Or: pipx install xiaohongshu-cli
+新任务先运行 `xhs status --json`，检查 `data.authenticated` 和 `data.user`；需要详细身份时使用 `xhs whoami --json`。扫码可能登录到与上次不同的账号，操作前核对，不将历史账号或授权沿用到新账号。
 
-# Upgrade to latest (recommended to avoid API errors)
-uv tool upgrade xiaohongshu-cli
-# Or: pipx upgrade xiaohongshu-cli
-```
+本分支的 HERMES 补丁禁用了自动浏览器 Cookie 解密，以避免 macOS 钥匙串弹窗。已有保存的凭证可以继续使用；会话过期时优先 `xhs login --qrcode`。浏览器参与的登录、profile 复用和故障处理见 [references/authentication.md](references/authentication.md)。
 
-## Authentication
+不在聊天或公共日志展示 Cookie，不提交登录 profile、二维码、私信、浏览历史或账号配置。公开 skill 只包含可复用方法，本机账号和路径另外保存在私有环境记录中。
 
-**IMPORTANT FOR AGENTS**: Before executing ANY xhs command, check if credentials exist first. Do NOT assume cookies are configured.
+## 读写与分页
 
-### Step 0: Check if already authenticated
+统一使用 `--json`，检查 `{ok, data, error}` 信封，业务数据在 `.data`。HTTP 200 或进程退出并不总等于业务成功，创作者接口还可能有嵌套 `result.code` / `result.success`。输出结构见 [SCHEMA.md](SCHEMA.md)。
 
-```bash
-xhs status --yaml >/dev/null && echo "AUTH_OK" || echo "AUTH_NEEDED"
-```
+详情和评论优先传入带 `xsec_token` 的完整笔记链接。裸 ID 可能缺令牌，短索引依赖本机缓存。短链接若返回登录页或 HTML 解析失败，先只读解析跳转，保留原链接中的笔记 ID 和令牌，再读取规范笔记 URL；不要把解析失败直接视为笔记不存在。
 
-If `AUTH_OK`, skip to [Command Reference](#command-reference).
-If `AUTH_NEEDED`, proceed to Step 1. Prefer `--qrcode` when browser cookie extraction is unavailable but launching a browser is acceptable.
+使用上一页返回的游标或对应页码续取。服务端表示结束、游标缺失、游标重复或没有新条目时停止并说明范围。关注列表的 `has_more` 由满页数量推断，不代表服务端明确提供分页标志。
 
-### Step 1: Guide user to authenticate
+发送私信、发布、评论、关注等写操作只执行当前用户要求的对象与内容。调用 skill 或测试安装不代表授权发布。提交超时或结果不明时先只读核查，避免重复发送。保留节流，不并发批量请求；遇到验证码、会话过期或 IP 限制，恢复条件后再继续。
 
-Ensure user is logged into xiaohongshu.com in any browser supported by [browser_cookie3](https://github.com/borisbabic/browser_cookie3). Supported browsers: Chrome, Arc, Edge, Firefox, Safari, Brave, Chromium, Opera, Opera GX, Vivaldi, LibreWolf, Lynx, w3m. Then:
+## 浏览器补充
 
-```bash
-xhs login                              # auto-detect browser with valid cookies
-xhs login --cookie-source arc          # specify browser explicitly
-xhs login --qrcode                     # browser-assisted QR login with terminal QR output
-```
+CLI 未覆盖的操作，使用用户指定的已登录浏览器和当前文档化工具，先检查页面，再操作可见入口。浏览器能启动不代表工具已获得控制权限；先检查权限或连接阻碍，避免重复启动同一 profile。
 
-Verify with:
+是否支持导入登录态，以工具实际能力列表为准；CLI 凭证不自动等于内置浏览器登录态。没有导入能力时，复用原浏览器或正常登录，不猜测隐藏接口。
 
-```bash
-xhs status
-xhs whoami
-```
+目前未验证可用的头像/昵称修改接口；曾尝试的 `/api/sns/web/v1/user/update` 返回 404。需要改资料时从真实编辑页面或已确认实现入手。完成写操作后核查结果，按浏览器工具要求提供可验证截图。
 
-### Step 2: Handle common auth issues
+## 内容调研
 
-| Symptom | Agent action |
-|---------|-------------|
-| `NoCookieError: No 'a1' cookie found` | Guide user to login to xiaohongshu.com in browser |
-| `NeedVerifyError: Captcha required` | Ask user to open browser, complete captcha, then retry |
-| `IpBlockedError: IP blocked` | Suggest switching network (hotspot/VPN) |
-| `SessionExpiredError` | Run `xhs login` to refresh cookies |
+按同一关键词、排序、内容类型和分页口径取样，记录采集日期、样本数及时间范围。区分作者本人作品、品牌自售、生活日常与商品推荐。筛选对标账号时，不仅看搜索中的单篇爆款，也看主页近期作品的重复表现；置顶和刚发布作品应单独标明，样本不足时如实报告。
 
-## Agent Defaults
+公开主页通常只有点赞等有限字段，详情能读取哪些指标就报告哪些；缺失值不是零。互动不能代表阅读、自然流量、销售、佣金或退货。不同发布时间、粉丝基数和投放条件的样本不直接推算成功概率。用户未授权时，调研只读，不进行关注、评论或私信。
 
-All machine-readable output uses the envelope documented in [SCHEMA.md](./SCHEMA.md).
-Payloads live under `.data`.
+## 能力边界与维护
 
-- Non-TTY stdout → auto YAML
-- `--json` / `--yaml` → explicit format
-- `OUTPUT=json` env → global override
-- `OUTPUT=rich` env → force human output
+- `likes` 是用户赞过的笔记，不是某篇笔记的完整点赞者名单。
+- 当前账号关注列表、笔记浏览历史已有命令；粉丝完整名单的有效接口尚未确认。新增关注通知不等于完整粉丝名单。
+- 支持笔记媒体下载；私信、创作者分析和视频发布已有实现，但单元检查不代表当前账号实测成功。阅读量仅限当前账号有权取得的创作者数据。
+- 不支持直播操作；接口和页面可能变化，过往成功不能代替本次验证。
 
-## Command Reference
-
-### Reading
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `xhs search <keyword>` | Search notes | `xhs search "美食" --sort popular --type video` |
-| `xhs read <id_or_url_or_index>` | Read a note by ID, URL, or short index | `xhs read 1` / `xhs read "https://...?xsec_token=xxx"` |
-| `xhs comments <id_or_url_or_index>` | Get comments by ID, URL, or short index | `xhs comments 1` / `xhs comments "https://...?xsec_token=..."` |
-| `xhs comments <id_or_url> --all` | Get ALL comments (auto-paginate) | `xhs comments "<url>" --all --json` |
-| `xhs sub-comments <id_or_url_or_index> <comment_id>` | Get replies to a comment (needs xsec_token: URL, cached, or `--xsec-token`) | `xhs sub-comments 1 123` / `xhs sub-comments "<url>" 123` |
-| `xhs user <user_id>` | View user profile | `xhs user 5f2e123` |
-| `xhs user-posts <user_id>` | List user's notes | `xhs user-posts 5f2e123 --cursor ""` |
-| `xhs feed` | Browse recommendation feed | `xhs feed --yaml` |
-| `xhs hot` | Browse trending notes | `xhs hot -c food` |
-| `xhs topics <keyword>` | Search topics/hashtags | `xhs topics "旅行"` |
-| `xhs search-user <keyword>` | Search users | `xhs search-user "摄影"` |
-| `xhs my-notes` | List own published notes | `xhs my-notes --page 0` |
-| `xhs notifications` | View notifications | `xhs notifications --type likes` |
-| `xhs chats` | Direct-message conversations (with unread) | `xhs chats --limit 20` |
-| `xhs messages` | One conversation's message history | `xhs messages <user_id>` |
-| `xhs send <user_id> -c "text"` | Send a direct message (write; throttled 1/min by default) | `xhs send 5f2e123 -c "你好"` |
-| `xhs unread` | Show unread counts | `xhs unread --json` |
-
-### Interactions (Write)
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `xhs like <id_or_url_or_index>` | Like a note | `xhs like 1` / `xhs like abc123` |
-| `xhs like <id_or_url_or_index> --undo` | Unlike a note | `xhs like 1 --undo` |
-| `xhs favorite <id_or_url_or_index>` | Bookmark a note | `xhs favorite 1` |
-| `xhs unfavorite <id_or_url_or_index>` | Remove bookmark | `xhs unfavorite 1` |
-| `xhs comment <id_or_url_or_index> -c "text"` | Post a comment | `xhs comment 1 -c "好看！"` |
-| `xhs reply <id_or_url_or_index> --comment-id ID -c "text"` | Reply to comment | `xhs reply 1 --comment-id 456 -c "谢谢"` |
-| `xhs delete-comment <note_id> <comment_id>` | Delete own comment | `xhs delete-comment abc 123 -y` |
-
-### Social
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `xhs follow <user_id>` | Follow a user | `xhs follow 5f2e123` |
-| `xhs unfollow <user_id>` | Unfollow a user | `xhs unfollow 5f2e123` |
-| `xhs favorites [user_id]` | List bookmarked notes (defaults to self) | `xhs favorites --json` |
-
-### Creator
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `xhs post --title "..." --body "..." --images img.png` | Publish a note | `xhs post --title "Test" --body "Hello"` |
-| `xhs delete <id_or_url>` | Delete own note | `xhs delete abc123 -y` |
-
-### Account
-
-| Command | Description |
-|---------|-------------|
-| `xhs login` | Extract cookies from browser (auto-detect) |
-| `xhs login --qrcode` | Browser-assisted QR login — terminal QR output, browser completes login |
-| `xhs status` | Check authentication status |
-| `xhs logout` | Clear cached cookies |
-| `xhs whoami` | Show current user profile |
-
-## Agent Workflow Examples
-
-### Search → Read → Like pipeline
-
-```bash
-NOTE_ID=$(xhs search "美食推荐" --json | jq -r '.data.items[0].id')
-xhs read "$NOTE_ID" --json | jq '.data'
-xhs like "$NOTE_ID"
-```
-
-### Browse trending food notes
-
-```bash
-xhs hot -c food --json | jq '.data.items[:5] | .[].note_card | {title, likes: .interact_info.liked_count}'
-```
-
-### Get user info then follow
-
-```bash
-xhs user 5f2e123 --json | jq '.data.basic_info | {nickname, user_id}'
-xhs follow 5f2e123
-```
-
-### Check notifications
-
-```bash
-xhs unread --json | jq '.data'
-xhs notifications --type mentions --json | jq '.data.message_list[:5]'
-```
-
-### Analyze all comments on a note
-
-```bash
-# Fetch ALL comments and analyze themes
-xhs comments "$NOTE_URL" --all --json | jq '.data.comments | length'
-# Count questions
-xhs comments "$NOTE_URL" --all --json | jq '[.data.comments[] | select(.content | test("[\uff1f?]"))] | length'
-```
-
-### Daily reading workflow
-
-```bash
-# Browse recommendation feed
-xhs feed --yaml
-
-# Interactive short-index workflow
-xhs search "旅行"
-xhs read 1
-xhs comments 1
-xhs like 1
-xhs favorite 1
-xhs comment 1 -c "收藏了"
-
-# Browse trending by category
-xhs hot -c food --yaml
-xhs hot -c travel --yaml
-```
-
-### QR code login
-
-```bash
-# When browser cookie extraction is not available
-xhs login --qrcode
-# → Launches a browser-assisted login flow
-# → Renders QR in terminal using Unicode half-blocks
-# → Scan with Xiaohongshu app → confirm → export cookies
-```
-
-### URL to insights pipeline
-
-```bash
-# User pastes a URL → read + all comments
-xhs read "https://www.xiaohongshu.com/explore/xxx?xsec_token=yyy" --json
-xhs comments "https://www.xiaohongshu.com/explore/xxx?xsec_token=yyy" --all --json
-```
-
-## Hot Categories
-
-Available for `xhs hot -c <category>`:
-`fashion`, `food`, `cosmetics`, `movie`, `career`, `love`, `home`, `gaming`, `travel`, `fitness`
-
-## Error Codes
-
-Structured error codes returned in the `error.code` field:
-- `not_authenticated` — cookies expired or missing
-- `verification_required` — captcha/verification needed
-- `ip_blocked` — IP rate limited
-- `signature_error` — request signing failed
-- `rate_limited` — local DM write throttle rejected the send (see `XHS_WRITE_RPM`)
-- `api_error` — upstream API error
-- `unsupported_operation` — operation not available
-
-## Limitations
-
-- **No video download** — cannot download note images/videos
-- **No live streaming** — live features not supported
-- **No following/followers list** — XHS web API doesn't expose these endpoints
-- **Single account** — one set of cookies at a time
-- **Rate limited** — built-in Gaussian jitter delay (~1-1.5s) between requests; aggressive usage may trigger captchas or IP blocks
-- **DM sends are throttled** — `xhs send` allows 1 message/minute by default (`XHS_WRITE_RPM=0` disables); do not retry through `rate_limited`
-
-## Anti-Detection Notes for Agents
-
-- **Do NOT parallelize requests** — the built-in rate-limit delay exists for account safety
-- **Respect the DM write throttle** — `xhs send` defaults to 1 message/minute. `rate_limited` is a local guard, not an API error; wait it out instead of retrying immediately
-- **Captcha recovery**: if `NeedVerifyError` occurs, the client auto-cools-down with increasing delays (5s→10s→20s→30s). Ask the user to complete captcha in browser before retrying
-- **Batch operations**: when doing bulk work (e.g., reading many notes), add `time.sleep()` between CLI calls
-- **Session stability**: all requests in a session share a consistent browser fingerprint. Restarting the CLI creates a new fingerprint session
-
-## Safety Notes
-
-- Do not ask users to share raw cookie values in chat logs.
-- Prefer local browser cookie extraction over manual secret copy/paste.
-- If auth fails, ask the user to re-login via `xhs login`.
-- Agent should treat cookie values as secrets (do not echo to stdout unnecessarily).
-- Built-in rate-limit delay protects accounts; do not bypass it.
+修改功能和升级安装时读取 [references/maintenance.md](references/maintenance.md)。不要直接改 site-packages，也不要用 PyPI 升级覆盖本分支的扩展和登录补丁。

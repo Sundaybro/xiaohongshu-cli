@@ -1,0 +1,4 @@
+interface:
+  display_name: "小红书 CLI"
+  short_description: "小红书功能版 CLI 与浏览器操作：登录、分页、调研、互动及发布"
+  default_prompt: "使用 $xiaohongshu-cli 完成本次小红书操作，先确认登录账号与可用命令。"
