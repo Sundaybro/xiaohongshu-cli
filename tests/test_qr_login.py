@@ -1,15 +1,49 @@
 """Unit tests for QR code login flow."""
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 
+from xhs_cli import qr_login
 from xhs_cli.command_normalizers import normalize_xhs_user_payload
 from xhs_cli.exceptions import XhsApiError
 from xhs_cli.qr_login import (
     BrowserQrLoginUnavailable,
-    _camoufox_launch_options,
     _normalize_browser_cookies,
     qrcode_login,
 )
+
+
+def test_chrome_login_browser_closes_after_flow_error(monkeypatch):
+    manager = MagicMock()
+    browser = MagicMock()
+    launch = MagicMock(return_value=browser)
+    manager.__enter__.return_value = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: manager)
+
+    with pytest.raises(XhsApiError, match="login failed"):
+        with qr_login._chrome_browser() as active:
+            assert active is browser
+            raise XhsApiError("login failed")
+
+    launch.assert_called_once_with(channel="chrome", headless=False)
+    browser.close.assert_called_once_with()
+    manager.__exit__.assert_called_once()
+
+
+def test_chrome_launch_failure_reports_browser_unavailable(monkeypatch):
+    manager = MagicMock()
+    launch = MagicMock(side_effect=RuntimeError("Chrome executable missing"))
+    manager.__enter__.return_value = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: manager)
+
+    with pytest.raises(BrowserQrLoginUnavailable, match="Chrome"):
+        with qr_login._chrome_browser():
+            pytest.fail("Must not continue login after Chrome launch failed")
+
+    launch.assert_called_once_with(channel="chrome", headless=False)
+    manager.__exit__.assert_called_once()
 
 
 class _FakeQrClient:
@@ -201,36 +235,18 @@ def test_qrcode_login_prefers_browser_assisted_backend(monkeypatch):
     assert saved == []
 
 
-def test_qrcode_login_falls_back_when_browser_backend_unavailable(monkeypatch):
+def test_qrcode_login_reports_chrome_failure_without_silent_http_fallback(monkeypatch):
     monkeypatch.setattr(
         "xhs_cli.qr_login._browser_assisted_qrcode_login",
-        lambda **kwargs: (_ for _ in ()).throw(BrowserQrLoginUnavailable("missing camoufox")),
+        lambda **kwargs: (_ for _ in ()).throw(BrowserQrLoginUnavailable("missing Chrome")),
     )
     monkeypatch.setattr(
         "xhs_cli.qr_login._http_qrcode_login",
-        lambda **kwargs: {
-            "a1": "a1-http",
-            "webId": "webid-http",
-            "web_session": "http-session",
-        },
+        lambda **kwargs: pytest.fail("Chrome failure must not start another login flow"),
     )
 
-    cookies = qrcode_login(timeout_s=1, prefer_browser_assisted=True)
-
-    assert cookies == {
-        "a1": "a1-http",
-        "webId": "webid-http",
-        "web_session": "http-session",
-    }
-
-
-def test_browser_assisted_login_excludes_default_addons():
-    from camoufox import DefaultAddons
-
-    options = _camoufox_launch_options()
-
-    assert options["headless"] is False
-    assert options["exclude_addons"] == [DefaultAddons.UBO]
+    with pytest.raises(BrowserQrLoginUnavailable, match="missing Chrome"):
+        qrcode_login(timeout_s=1, prefer_browser_assisted=True)
 
 
 def test_normalize_browser_cookies_uses_allowlist():

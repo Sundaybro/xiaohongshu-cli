@@ -27,7 +27,7 @@ dependencies = [
     "xhshow>=0.1.9",
     "PyYAML>=6.0",
     "qrcode>=7.0",
-    "camoufox>=0.4.11",
+    "playwright>=1.58",
 ]
 
 [project.optional-dependencies]

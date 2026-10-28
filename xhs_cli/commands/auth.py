@@ -56,7 +56,7 @@ def _print_status_summary(user: dict[str, object]) -> None:
 )
 @structured_output_options
 @click.option("--qrcode", "use_qrcode", is_flag=True, default=False,
-              help="Login via QR code (scan with Xiaohongshu app)")
+              help="Login via Google Chrome QR code (scan with Xiaohongshu app)")
 @click.pass_context
 def login(ctx, cookie_source: str | None, as_json: bool, as_yaml: bool, use_qrcode: bool):
     """Log in by extracting cookies from browser, or via QR code."""

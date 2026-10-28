@@ -11,7 +11,7 @@ description: 使用 xiaohongshu-cli 功能版或已登录浏览器操作小红�
 
 新任务先运行 `xhs status --json`，检查 `data.authenticated` 和 `data.user`；需要详细身份时使用 `xhs whoami --json`。扫码可能登录到与上次不同的账号，操作前核对，不将历史账号或授权沿用到新账号。
 
-本分支的 HERMES 补丁禁用了自动浏览器 Cookie 解密，以避免 macOS 钥匙串弹窗。已有保存的凭证可以继续使用；会话过期时优先 `xhs login --qrcode`。浏览器参与的登录、profile 复用和故障处理见 [references/authentication.md](references/authentication.md)。
+本分支的 HERMES 补丁禁用了自动浏览器 Cookie 解密，以避免 macOS 钥匙串弹窗。已有保存的凭证可以继续使用；会话过期时优先 `xhs login --qrcode`，使用已安装的 Google Chrome 独立扫码窗口。浏览器参与的登录、profile 复用和故障处理见 [references/authentication.md](references/authentication.md)。
 
 不在聊天或公共日志展示 Cookie，不提交登录 profile、二维码、私信、浏览历史或账号配置。公开 skill 只包含可复用方法，本机账号和路径另外保存在私有环境记录中。
 
@@ -27,7 +27,7 @@ description: 使用 xiaohongshu-cli 功能版或已登录浏览器操作小红�
 
 ## 浏览器补充
 
-CLI 未覆盖的操作，使用用户指定的已登录浏览器和当前文档化工具，先检查页面，再操作可见入口。浏览器能启动不代表工具已获得控制权限；先检查权限或连接阻碍，避免重复启动同一 profile。
+CLI 未覆盖的操作，优先复用 Chrome 或内置浏览器中已登录、可控制的页面；用户指定其他浏览器时按其选择。使用当前文档化工具，先检查页面，再操作可见入口。Camoufox 不再是默认入口，不因旧 profile 有登录态就自动启动。浏览器能启动不代表工具已获得控制权限；先检查权限或连接阻碍，避免重复启动同一 profile。
 
 是否支持导入登录态，以工具实际能力列表为准；CLI 凭证不自动等于内置浏览器登录态。没有导入能力时，复用原浏览器或正常登录，不猜测隐藏接口。
 

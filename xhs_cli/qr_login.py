@@ -1,21 +1,21 @@
 """QR code login for Xiaohongshu.
 
 Supports two backends:
-1. Browser-assisted login via Camoufox.  The browser performs the real
+1. Browser-assisted login via Google Chrome.  The browser performs the real
    QR completion flow, while the CLI renders the QR code in the terminal
    from the browser's ``qrcode/create`` response and exports cookies after
    login succeeds.
-2. Legacy pure-HTTP login flow.  This remains as a fallback when the
-   browser backend is unavailable.
+2. Legacy pure-HTTP login flow, used only when browser-assisted login is
+   not requested. Browser startup failures are reported directly.
 """
 
 from __future__ import annotations
 
 import logging
 import random
-import subprocess
-import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from .client import XhsClient
@@ -310,41 +310,28 @@ def _display_qr_in_terminal(data: str) -> bool:
     return True
 
 
-def _ensure_camoufox_ready() -> None:
-    """Validate that the Camoufox package and browser binary are available."""
+@contextmanager
+def _chrome_browser() -> Iterator[Any]:
+    """Start installed Chrome in an isolated session and always close it."""
     try:
-        import camoufox  # noqa: F401
+        from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise BrowserQrLoginUnavailable(
-            "Browser-assisted QR login requires the `camoufox` package."
+            "Chrome QR login requires the `playwright` package."
         ) from exc
 
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "camoufox", "path"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise BrowserQrLoginUnavailable(
-            "Unable to validate the Camoufox browser installation."
-        ) from exc
-
-    if result.returncode != 0 or not result.stdout.strip():
-        raise BrowserQrLoginUnavailable(
-            "Camoufox browser runtime is missing. Run `python -m camoufox fetch` first."
-        )
-
-
-def _camoufox_launch_options() -> dict[str, Any]:
-    """Return Camoufox launch options for browser-assisted QR login."""
-    from camoufox import DefaultAddons
-
-    return {
-        "headless": False,
-        "exclude_addons": [DefaultAddons.UBO],
-    }
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(channel="chrome", headless=False)
+        except Exception as exc:
+            raise BrowserQrLoginUnavailable(
+                "Unable to start Google Chrome for QR login. Check that Chrome is installed "
+                "and can open, or log in through Chrome/the in-app browser for page operations."
+            ) from exc
+        try:
+            yield browser
+        finally:
+            browser.close()
 
 
 def _browser_assisted_qrcode_login(
@@ -353,21 +340,11 @@ def _browser_assisted_qrcode_login(
     timeout_s: int = POLL_TIMEOUT_S,
 ) -> dict[str, str]:
     """Log in by letting a real browser complete the QR flow, then export cookies."""
-    _ensure_camoufox_ready()
-
-    try:
-        from camoufox.sync_api import Camoufox
-        launch_options = _camoufox_launch_options()
-    except ImportError as exc:
-        raise BrowserQrLoginUnavailable(
-            "Camoufox sync API is unavailable in the current environment."
-        ) from exc
-
     state = {"last_status": -1}
 
-    _emit_status(on_status, "🔑 Starting browser-assisted QR login...")
+    _emit_status(on_status, "🔑 Starting Google Chrome QR login...")
 
-    with Camoufox(**launch_options) as browser:
+    with _chrome_browser() as browser:
         page = browser.new_page()
 
         def _handle_response(response) -> None:
@@ -399,7 +376,7 @@ def _browser_assisted_qrcode_login(
             ) as qr_response_info:
                 page.goto(LOGIN_URL, wait_until="domcontentloaded")
         except Exception as exc:
-            raise XhsApiError("Failed to load Xiaohongshu login page in Camoufox.") from exc
+            raise XhsApiError("Failed to load Xiaohongshu login page in Google Chrome.") from exc
 
         qr_payload = _browser_response_payload(qr_response_info.value)
         qr_url = str(qr_payload.get("url", "")).strip()
@@ -551,9 +528,6 @@ def qrcode_login(
 ) -> dict[str, str]:
     """Run the QR code login flow."""
     if prefer_browser_assisted:
-        try:
-            return _browser_assisted_qrcode_login(on_status=on_status, timeout_s=timeout_s)
-        except BrowserQrLoginUnavailable as exc:
-            logger.info("Browser-assisted QR login unavailable, falling back to HTTP flow: %s", exc)
+        return _browser_assisted_qrcode_login(on_status=on_status, timeout_s=timeout_s)
 
     return _http_qrcode_login(on_status=on_status, timeout_s=timeout_s)
